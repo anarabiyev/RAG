@@ -2,21 +2,45 @@
 main.py — Command-line entry point for the from-scratch RAG system.
 
 Usage:
-    python main.py                       # interactive: ask questions in a loop
-    python main.py "who created Rust?"   # one-shot: answer a single question
-    python main.py --k 6 "..."           # retrieve more chunks per question
+    python main.py                          # interactive: ask questions in a loop
+    python main.py "who created Rust?"      # one-shot: answer a single question
+    python main.py --k 6 "..."              # retrieve more chunks per question
+    python main.py --chunker recursive "..."   # pick a chunking strategy
+    python main.py --chunker semantic "..."
 
-The first run downloads the embedding model (~80 MB) once, then caches it.
-Answer generation needs OPENAI_API_KEY (put it in a .env file); without it, you
-still get the retrieved passages so you can see retrieval working on its own.
+Chunking strategies (see chunkers.py). All sizes are measured in TOKENS:
+    fixed       fixed token windows + overlap         (the original baseline)
+    recursive   respect paragraph/line/sentence boundaries, recursively
+    sentence    whole sentences grouped to a token budget
+    semantic    cut where the topic actually shifts (uses the embedding model)
+
+The first run downloads the embedding model (~80 MB) once, then caches it, and
+tiktoken downloads its vocab once. Answer generation needs OPENAI_API_KEY (put
+it in a .env file); without it, you still get the retrieved passages.
 """
 
-import sys
 import argparse
 
-from rag import RAG
+from rag import RAG, Embedder
+from chunkers import (Tokenizer, FixedTokenChunker, RecursiveChunker,
+                      SentenceChunker, SemanticChunker)
 
 CORPUS_DIR = "corpus"
+
+
+def build_chunker(name: str, embedder: Embedder, tokenizer: Tokenizer):
+    """Construct the requested chunker. Everything shares one `tokenizer` (so
+    sizes are comparable and tiktoken loads once); the semantic chunker also
+    reuses `embedder` so the embedding model isn't loaded twice."""
+    if name == "fixed":
+        return FixedTokenChunker(chunk_size=200, overlap=40, tokenizer=tokenizer)
+    if name == "recursive":
+        return RecursiveChunker(chunk_size=200, overlap=40, tokenizer=tokenizer)
+    if name == "sentence":
+        return SentenceChunker(max_tokens=200, overlap_sentences=1, tokenizer=tokenizer)
+    if name == "semantic":
+        return SemanticChunker(embedder, percentile=90, max_tokens=256, tokenizer=tokenizer)
+    raise ValueError(f"unknown chunker: {name}")
 
 
 def print_result(result: dict) -> None:
@@ -40,10 +64,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Minimal from-scratch RAG.")
     parser.add_argument("question", nargs="*", help="A question to answer. Omit for interactive mode.")
     parser.add_argument("--k", type=int, default=4, help="Number of chunks to retrieve (default 4).")
+    parser.add_argument("--chunker", default="recursive",
+                        choices=["fixed", "recursive", "sentence", "semantic"],
+                        help="Chunking strategy (default: recursive).")
     args = parser.parse_args()
 
-    print(f"Building index from '{CORPUS_DIR}/' ...")
-    rag = RAG(CORPUS_DIR)
+    # Build the embedder and tokenizer once, then share them with everything.
+    embedder = Embedder()
+    tokenizer = Tokenizer()
+    chunker = build_chunker(args.chunker, embedder, tokenizer)
+
+    print(f"Building index from '{CORPUS_DIR}/' using '{args.chunker}' chunking ...")
+    rag = RAG(CORPUS_DIR, chunker=chunker, embedder=embedder)
     n = rag.build_index()
     print(f"Indexed {n} chunks.\n")
 

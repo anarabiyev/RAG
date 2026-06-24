@@ -16,16 +16,18 @@ The only third-party pieces are:
   - openai (optional)     : writes the final answer (skip it to run retrieval-only)
   - python-dotenv         : loads your OPENAI_API_KEY from a local .env file
 
-Read the four sections below in order. Each is small on purpose.
+The CHUNKING step now lives in chunkers.py, which offers several strategies you
+can swap between. Read the four sections below in order, then read chunkers.py.
 """
 
 from __future__ import annotations
 
 import os
-import glob
-from dataclasses import dataclass, field
 
 import numpy as np
+
+# Chunking strategies live in their own module now.
+from chunkers import Chunk, Chunker, FixedTokenChunker
 
 # Load environment variables from a local .env file if python-dotenv is present.
 # This is what makes OPENAI_API_KEY available without exporting it by hand.
@@ -39,17 +41,11 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # SECTION 1 — Loading and chunking
 # ---------------------------------------------------------------------------
-# An LLM can only be handed so much text at once, and similarity search works
-# best on focused passages rather than whole documents. So we split each
-# document into overlapping "chunks". Overlap keeps a sentence that straddles
-# a boundary from being cut in half and losing its meaning.
+# Loading reads files off disk. Chunking — splitting each document into
+# focused, retrievable passages — is now pluggable: see chunkers.py for the
+# strategies (fixed window, recursive, sentence, semantic).
 
-@dataclass
-class Chunk:
-    """One retrievable passage of text, plus where it came from."""
-    text: str
-    source: str          # filename the chunk came from
-    index: int           # position of this chunk within that file
+import glob
 
 
 def load_documents(corpus_dir: str) -> list[tuple[str, str]]:
@@ -73,34 +69,11 @@ def load_documents(corpus_dir: str) -> list[tuple[str, str]]:
     return docs
 
 
-def chunk_text(text: str, source: str, chunk_size: int = 120, overlap: int = 30) -> list[Chunk]:
-    """Split text into overlapping word-windows.
-
-    chunk_size and overlap are measured in *words* here to keep things simple
-    and readable. (A common upgrade is to chunk by tokens or by sentence
-    boundaries — see the README's "ways to extend this".)
-    """
-    words = text.split()
-    if not words:
-        return []
-
-    step = max(1, chunk_size - overlap)
-    chunks: list[Chunk] = []
-    for i, start in enumerate(range(0, len(words), step)):
-        window = words[start:start + chunk_size]
-        if not window:
-            break
-        chunks.append(Chunk(text=" ".join(window), source=source, index=i))
-        if start + chunk_size >= len(words):
-            break  # we've covered the whole document
-    return chunks
-
-
-def build_chunks(corpus_dir: str, chunk_size: int = 120, overlap: int = 30) -> list[Chunk]:
-    """Load every document and chunk them all into one flat list."""
+def build_chunks(corpus_dir: str, chunker: Chunker) -> list[Chunk]:
+    """Load every document and run the chosen chunker over all of them."""
     chunks: list[Chunk] = []
     for source, text in load_documents(corpus_dir):
-        chunks.extend(chunk_text(text, source, chunk_size, overlap))
+        chunks.extend(chunker.split(text, source))
     return chunks
 
 
@@ -147,8 +120,10 @@ def _normalize(vectors: np.ndarray) -> np.ndarray:
 #
 # A real system would use a vector database (Chroma, FAISS, Qdrant, ...) so it
 # scales to millions of vectors and persists to disk. For a few thousand
-# chunks, this 15-line version behaves identically — and you can see exactly
-# what those databases are doing under the hood.
+# chunks, this 15-line version behaves identically.
+
+from dataclasses import dataclass, field
+
 
 @dataclass
 class VectorStore:
@@ -178,8 +153,6 @@ class VectorStore:
 # provided context — and to say "I don't know" otherwise — is what keeps the
 # model grounded instead of falling back on its own memory.
 
-# Swap this for any model you have access to. gpt-4o-mini is cheap and fast;
-# larger models are stronger. See https://platform.openai.com/docs/models.
 DEFAULT_MODEL = "gpt-4o-mini"
 
 SYSTEM_PROMPT = (
@@ -206,7 +179,6 @@ def generate_answer(question: str, retrieved: list[tuple[Chunk, float]], model: 
 
     If the 'openai' package isn't installed or no API key is set, we return
     None so the caller can fall back to showing the retrieved chunks only.
-    That way the retrieval half of the system is fully usable with zero setup.
     """
     if not os.environ.get("OPENAI_API_KEY"):
         return None
@@ -216,8 +188,6 @@ def generate_answer(question: str, retrieved: list[tuple[Chunk, float]], model: 
         return None
 
     client = OpenAI()  # reads OPENAI_API_KEY from the environment (loaded from .env)
-    # Note: OpenAI passes the system prompt as the first message with role
-    # "system", whereas Anthropic uses a separate top-level `system` argument.
     response = client.chat.completions.create(
         model=model,
         max_tokens=512,
@@ -234,19 +204,24 @@ def generate_answer(question: str, retrieved: list[tuple[Chunk, float]], model: 
 # ---------------------------------------------------------------------------
 
 class RAG:
-    """Ties the four sections into one object: build an index, then query it."""
+    """Ties the four sections into one object: build an index, then query it.
 
-    def __init__(self, corpus_dir: str, chunk_size: int = 120, overlap: int = 30,
+    You can hand it any chunker from chunkers.py. You can also hand it an
+    already-constructed Embedder — useful because the SemanticChunker needs an
+    embedder too, and sharing one instance means the 80 MB model loads once.
+    """
+
+    def __init__(self, corpus_dir: str, chunker: Chunker | None = None,
+                 embedder: Embedder | None = None,
                  model_name: str = "all-MiniLM-L6-v2"):
         self.corpus_dir = corpus_dir
-        self.chunk_size = chunk_size
-        self.overlap = overlap
-        self.embedder = Embedder(model_name)
+        self.embedder = embedder or Embedder(model_name)
+        self.chunker = chunker or FixedTokenChunker()
         self.store = VectorStore()
 
     def build_index(self) -> int:
         """Load, chunk, embed, and store everything. Returns the chunk count."""
-        chunks = build_chunks(self.corpus_dir, self.chunk_size, self.overlap)
+        chunks = build_chunks(self.corpus_dir, self.chunker)
         vectors = self.embedder.encode([c.text for c in chunks])
         self.store.add(chunks, vectors)
         return len(chunks)
