@@ -1,0 +1,7 @@
+sentence-transformers>=2.2.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+
+# Optional — only needed to generate answers (the "G" in RAG).
+# Without it, the system still runs and shows retrieved passages.
+openai>=1.0.0
