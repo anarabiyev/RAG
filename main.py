@@ -16,14 +16,16 @@ Chunking strategies (see chunkers.py). All sizes are measured in TOKENS:
     semantic    cut where the topic actually shifts (uses the embedding model)
 
 Vector-store backends (see stores.py). The retrieved passages should be nearly
-identical across all three on a small corpus — the difference is scale/speed:
+identical across all backends on a small corpus — the difference is scale/speed:
     numpy       one numpy matrix, exact brute-force search   (the baseline)
     faiss       Meta's FAISS library: a fast in-process index (pip install faiss-cpu)
     chroma      an embedded vector database, SQLite-style     (pip install chromadb)
+    pinecone    a remote, managed vector database             (pip install pinecone)
 
 The first run downloads the embedding model (~80 MB) once, then caches it, and
 tiktoken downloads its vocab once. Answer generation needs OPENAI_API_KEY (put
-it in a .env file); without it, you still get the retrieved passages.
+it in a .env file); without it, you still get the retrieved passages. The
+pinecone store also needs PINECONE_API_KEY in that same .env file.
 """
 
 import argparse
@@ -31,7 +33,7 @@ import argparse
 from rag import RAG, Embedder
 from chunkers import (Tokenizer, FixedTokenChunker, RecursiveChunker,
                       SentenceChunker, SemanticChunker)
-from stores import NumpyStore, FaissStore, ChromaStore
+from stores import NumpyStore, FaissStore, ChromaStore, PineconeStore
 
 CORPUS_DIR = "corpus"
 
@@ -60,6 +62,8 @@ def build_store(name: str):
         return FaissStore()              # exact IndexFlatIP; pass index_type="hnsw" for ANN
     if name == "chroma":
         return ChromaStore()             # in-memory; pass persist_dir=... to keep on disk
+    if name == "pinecone":
+        return PineconeStore()           # remote; reads PINECONE_API_KEY from .env
     raise ValueError(f"unknown store: {name}")
 
 
@@ -88,7 +92,7 @@ def main() -> None:
                         choices=["fixed", "recursive", "sentence", "semantic"],
                         help="Chunking strategy (default: recursive).")
     parser.add_argument("--store", default="numpy",
-                        choices=["numpy", "faiss", "chroma"],
+                        choices=["numpy", "faiss", "chroma", "pinecone"],
                         help="Vector-store backend (default: numpy).")
     args = parser.parse_args()
 

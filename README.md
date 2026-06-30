@@ -14,8 +14,10 @@ documents ──▶ chunks ──▶ embeddings ──▶ vector store
 ```
 
 The retrieval half (finding the right passages) is pure math and runs with no
-API key. The generation half (writing the answer) calls an LLM. You can run the
-project with just retrieval to see that half working on its own.
+API key (the one exception is the `pinecone` store, a remote service that needs
+its own `PINECONE_API_KEY`). The generation half (writing the answer) calls an
+LLM. You can run the project with just retrieval to see that half working on its
+own.
 
 The very first step — **chunking** — is now pluggable: four strategies live in
 `chunkers.py`, and you choose one with `--chunker`. Chunking quietly sets a
@@ -24,9 +26,11 @@ it's worth understanding deeply, which is why this project makes the choice
 explicit rather than hiding it.
 
 The **vector store** — where the embeddings live and the nearest-neighbour
-search runs — is pluggable too: three backends live in `stores.py`, and you
+search runs — is pluggable too: four backends live in `stores.py`, and you
 choose one with `--store`. The default NumPy store is the from-scratch baseline;
-the other two (FAISS and Chroma) are the real tools you'd graduate to.
+FAISS and Chroma are the real tools you'd graduate to on your own machine; and
+Pinecone is the step off your machine entirely — a remote, managed database you
+talk to over the network.
 
 ## Quickstart
 
@@ -35,17 +39,20 @@ pip install -r requirements.txt
 
 # Optional: add your OpenAI key to get generated answers. Without it you
 # still see the retrieved passages, which is the retrieval half of RAG.
-cp .env.example .env      # then edit .env and paste in your key
+# The `pinecone` store also needs a PINECONE_API_KEY in the same .env file.
+cp .env.example .env      # then edit .env and paste in your key(s)
 
 python main.py                              # interactive question loop
 python main.py "who created Rust?"          # one-shot question
 python main.py --chunker semantic "..."     # pick a chunking strategy
 python main.py --store faiss "..."          # pick a vector-store backend
+python main.py --store pinecone "..."       # use a remote, managed vector DB
 python main.py --chunker fixed --k 6 "..."  # and how many chunks to retrieve
 ```
 
 The key is read from `.env` automatically (via python-dotenv), so you never
-have to export it by hand. `.env` is gitignored, so your key is never committed.
+have to export it by hand. `.env` is gitignored, so your keys are never
+committed.
 
 The first run downloads two things once and caches them: the embedding model
 (`all-MiniLM-L6-v2`, ~80 MB) and `tiktoken`'s tokenizer vocabulary (small).
@@ -81,7 +88,8 @@ the diagram above:
    and searches with a single matrix multiply that scores the query against
    every chunk at once; we keep the top *k*. That's exactly what a vector
    database does, minus the scaling and persistence — so `stores.py` also lets
-   you swap in the real thing (FAISS, Chroma) behind the same interface.
+   you swap in the real thing (FAISS, Chroma, or a remote Pinecone database)
+   behind the same interface.
 4. **Generation** — the retrieved chunks are pasted into a prompt that tells the
    LLM to answer *only* from that context and to say "I don't know" otherwise.
    That instruction is what keeps answers grounded instead of hallucinated.
@@ -124,7 +132,7 @@ semantic chunker caps chunks at 256 tokens.
 
 The vector store is the "database" at the heart of RAG: it holds one vector per
 chunk and, given the question's vector, returns the chunks whose vectors are
-closest. All three backends live in `stores.py` behind one interface (`.add`
+closest. All four backends live in `stores.py` behind one interface (`.add`
 and `.search`) — the same pattern as the chunkers — and every store returns a
 *similarity* score where higher means more relevant, so the retrieved passages
 are directly comparable across backends. Pick one with `--store`:
@@ -149,19 +157,38 @@ are directly comparable across backends. Pick one with `--store`:
   Its engine uses HNSW, so search is approximate. By default it's in-memory and
   vanishes on exit; pass `persist_dir=...` and it writes to disk. `pip install
   chromadb`.
+- **`pinecone`** — `PineconeStore`. The step off your machine entirely: a
+  **remote, managed** vector database you reach over the network with an API key
+  (`PINECONE_API_KEY`, read from `.env` like your OpenAI key). Unlike the three
+  above, the vectors don't live in your process at all — Pinecone stores them on
+  its servers and runs the nearest-neighbour search *there*, so a million-vector
+  corpus never has to fit in your RAM. Like Chroma it keeps your text and
+  metadata beside each vector and hands them back on query, so the store rebuilds
+  each `Chunk` from the match's metadata rather than keeping its own list; the
+  index is created with the cosine metric, whose score is already a similarity,
+  so (unlike Chroma's distance) no conversion is needed. It uses stable
+  `source-index` ids so re-runs overwrite instead of duplicating, and — because
+  `main.py` rebuilds the index every run while a real database *persists* — it
+  wipes its namespace on each run by default (`wipe=True`) to match the in-memory
+  stores; flip `wipe=False` and the index survives between runs, which is the
+  whole reason you'd reach for a database in the first place. The free tier is
+  serverless on AWS `us-east-1`, one index, 2 GB. `pip install pinecone`.
 
 A subtlety worth holding onto, parallel to the two-tokenizers note above: the
 backends differ on **exact vs approximate** search and on **where the vectors
 live**. NumPy and FAISS-`flat` are exact (they compare against every vector);
-FAISS-`hnsw` and Chroma are approximate (they navigate a graph and skip most).
-On the five-doc corpus all three return essentially identical passages — the
-approximate ones still find the true neighbours on data this small — so the
-point of switching `--store` here is to *confirm they agree*, not to change the
-results; the speedup only shows up with far more chunks. As for storage: the
-NumPy matrix and FAISS's vectors both sit in RAM and vanish when the process
-exits, while Chroma with `persist_dir` is the only one that survives a restart —
-it writes a `chroma.sqlite3` (text + metadata) alongside a binary HNSW index
-(the vectors plus the navigable graph that makes search sub-linear).
+FAISS-`hnsw`, Chroma, and Pinecone are approximate (they navigate a graph and
+skip most). On the five-doc corpus all four return essentially identical
+passages — the approximate ones still find the true neighbours on data this
+small — so the point of switching `--store` here is to *confirm they agree*, not
+to change the results; the speedup only shows up with far more chunks. As for
+where the vectors live: the NumPy matrix, FAISS's vectors, and an in-memory
+Chroma all sit in your process's RAM and vanish when it exits; Chroma with
+`persist_dir` writes them to local disk (a `chroma.sqlite3` of text + metadata
+beside a binary HNSW index) so they survive a restart; and Pinecone keeps them
+off your machine entirely, on its own servers, so they survive not just a
+restart but a move to a different computer — the price being a network hop and an
+API key on every call.
 
 ## Inspecting the chunkers
 
@@ -201,12 +228,17 @@ articles, or papers in a field you care about.
   long-context model, then pool into chunk vectors so each chunk keeps document
   context); or **contextual retrieval** (have an LLM prepend a one-line situating
   blurb to each chunk before embedding).
-- **A real vector DB** — *partly done.* `stores.py` now ships three backends
-  (numpy, faiss, chroma) behind one interface, chosen with `--store`. Natural
-  follow-ups: turn on Chroma's `persist_dir` so the index survives between runs;
-  try FAISS's `hnsw` index and measure the speed/recall tradeoff at scale; or
-  swap in a networked DB (Pinecone, Qdrant, Weaviate, or `pgvector` on Postgres)
-  to move storage and search off your machine onto a server you query.
+- **A real vector DB** — *done.* `stores.py` now ships four backends (numpy,
+  faiss, chroma, pinecone) behind one interface, chosen with `--store`, and
+  Pinecone is the networked database that moves storage and search off your
+  machine onto a server you query. Natural follow-ups: **split ingestion from
+  querying** so you build the index once and then answer questions against it
+  without re-embedding and re-upserting the whole corpus every run (the current
+  rebuild-each-run model is fine for five docs but wrong at scale); turn on
+  Pinecone **namespaces** to keep multiple corpora (or tenants) in one index and
+  isolate query cost; turn on Chroma's `persist_dir` so its index survives
+  between runs; or try other networked DBs (Qdrant, Weaviate, or `pgvector` on
+  Postgres).
 - **Hybrid search** — combine the embedding similarity with keyword (BM25)
   matching, which catches exact terms (names, error codes) that embeddings miss.
 - **Reranking** — retrieve the top ~30 chunks, then use a cross-encoder or a
@@ -223,12 +255,12 @@ articles, or papers in a field you care about.
 rag-from-scratch/
 ├── rag.py              # core pipeline: loading, embeddings, retrieval, generation
 ├── chunkers.py         # the four pluggable chunking strategies + the tokenizer
-├── stores.py           # the three pluggable vector-store backends (numpy/faiss/chroma)
+├── stores.py           # the four pluggable vector-store backends (numpy/faiss/chroma/pinecone)
 ├── main.py             # command-line interface (--chunker, --store, --k)
 ├── inspect_chunks.py   # helper: chunk counts + sizes per strategy (quick overview)
 ├── dump_chunks.py      # helper: every chunk printed in full per strategy
 ├── corpus/             # sample documents — replace with your own
-├── requirements.txt    # tiktoken + sentence-transformers; faiss-cpu/chromadb optional
-├── .env.example        # template — copy to .env and add your OpenAI key
+├── requirements.txt    # tiktoken + sentence-transformers; faiss-cpu/chromadb/pinecone optional
+├── .env.example        # template — copy to .env and add your OpenAI key (and Pinecone key)
 └── README.md
 ```

@@ -193,3 +193,116 @@ class ChromaStore(VectorStore):
             chunk = Chunk(text=doc, source=str(meta["source"]), index=int(meta["index"]))
             out.append((chunk, 1.0 - float(dist)))   # distance -> similarity
         return out
+
+
+# ---------------------------------------------------------------------------
+# 4 — PineconeStore  (a remote, managed vector DATABASE)
+# ---------------------------------------------------------------------------
+# The first store here that does NOT live in your process. Pinecone runs on
+# someone else's machines; you talk to it over the network with an API key.
+# That changes three things versus the stores above:
+#   1. It needs credentials (PINECONE_API_KEY, read from the environment).
+#   2. Creating an index is a remote, ASYNCHRONOUS call — you ask for an index,
+#      then poll until Pinecone reports it "ready" before you can write to it.
+#   3. The data PERSISTS between runs. main.py rebuilds every run, so we use
+#      stable per-chunk ids (source-index) — re-running overwrites instead of
+#      duplicating — and `wipe=True` clears the namespace first so each run
+#      starts clean, matching the in-memory stores. Set wipe=False and the
+#      index survives across runs: that persistence is the entire point of a
+#      real database, and the one capability NumPy/FAISS can't give you.
+#
+# Like Chroma, Pinecone stores your text + metadata next to the vector and
+# hands them back on query, so we DON'T keep our own chunk list — we rebuild
+# each Chunk from the match's metadata. We feed it the embeddings we already
+# computed (never let it embed for us) so the query and documents stay in the
+# SAME vector space the rest of the RAG uses. We create the index with the
+# cosine metric, whose score is similarity (higher = better) — so, unlike
+# Chroma's distance, no conversion is needed. `pip install pinecone`.
+
+class PineconeStore(VectorStore):
+    def __init__(self, index_name: str = "rag-from-scratch",
+                 cloud: str = "aws", region: str = "us-east-1",
+                 namespace: str = "default", wipe: bool = True,
+                 api_key: str | None = None):
+        import os
+        from pinecone import Pinecone
+        key = api_key or os.environ.get("PINECONE_API_KEY")
+        if not key:
+            raise RuntimeError(
+                "PINECONE_API_KEY not set. Put it in your .env "
+                "(it's loaded automatically) or pass api_key=...")
+        self.pc = Pinecone(api_key=key)
+        self.index_name = index_name
+        self.cloud = cloud
+        self.region = region
+        self.namespace = namespace
+        self.wipe = wipe
+        self.index = None          # connected lazily on first add (we need the dim)
+
+    def _ensure_index(self, dim: int) -> None:
+        """Create the index if it doesn't exist yet, wait until it's ready,
+        and connect to it. Dimension comes from the actual vectors, exactly
+        like FaissStore builds its index on first add."""
+        import time
+        from pinecone import ServerlessSpec
+        if not self.pc.has_index(self.index_name):
+            self.pc.create_index(
+                name=self.index_name,
+                dimension=dim,                  # 384 for all-MiniLM-L6-v2
+                metric="cosine",                # score == cosine similarity
+                spec=ServerlessSpec(cloud=self.cloud, region=self.region),
+            )
+            # Creation is async — block until Pinecone reports the index ready.
+            while not self._ready():
+                time.sleep(1)
+        self.index = self.pc.Index(self.index_name)
+        if self.wipe:
+            # Start each run clean (the in-memory stores are fresh every run).
+            try:
+                self.index.delete(delete_all=True, namespace=self.namespace)
+            except Exception:
+                pass  # namespace may not exist yet on a brand-new index
+
+    def _ready(self) -> bool:
+        status = self.pc.describe_index(self.index_name).status
+        # status is a dict on some SDK versions, an object on others.
+        return status.get("ready", False) if isinstance(status, dict) \
+            else getattr(status, "ready", False)
+
+    def add(self, chunks: list[Chunk], vectors: np.ndarray) -> None:
+        if len(chunks) == 0:
+            return
+        if self.index is None:
+            self._ensure_index(vectors.shape[1])
+        vectors = np.asarray(vectors, dtype=np.float32)
+        items = []
+        for chunk, vec in zip(chunks, vectors):
+            items.append({
+                "id": f"{chunk.source}-{chunk.index}",   # stable -> idempotent
+                "values": vec.tolist(),
+                "metadata": {"text": chunk.text,
+                             "source": chunk.source,
+                             "index": chunk.index},
+            })
+        # Upsert in batches (Pinecone caps a request at ~1000 vectors / 2 MB).
+        for start in range(0, len(items), 100):
+            self.index.upsert(vectors=items[start:start + 100],
+                              namespace=self.namespace)
+
+    def search(self, query_vector: np.ndarray, k: int = 4) -> list[tuple[Chunk, float]]:
+        if self.index is None:
+            return []
+        res = self.index.query(
+            vector=np.asarray(query_vector, dtype=np.float32).tolist(),
+            top_k=k,
+            namespace=self.namespace,
+            include_metadata=True,
+        )
+        out: list[tuple[Chunk, float]] = []
+        for match in res.matches:
+            meta = match.metadata or {}
+            chunk = Chunk(text=str(meta.get("text", "")),
+                          source=str(meta.get("source", "?")),
+                          index=int(meta.get("index", 0)))
+            out.append((chunk, float(match.score)))   # cosine sim, higher = better
+        return out
