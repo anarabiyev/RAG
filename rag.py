@@ -16,8 +16,10 @@ The only third-party pieces are:
   - openai (optional)     : writes the final answer (skip it to run retrieval-only)
   - python-dotenv         : loads your OPENAI_API_KEY from a local .env file
 
-The CHUNKING step now lives in chunkers.py, which offers several strategies you
-can swap between. Read the four sections below in order, then read chunkers.py.
+Two pipeline steps now live in their own modules, each behind one interface:
+  - CHUNKING       -> chunkers.py  (fixed / recursive / sentence / semantic)
+  - the VECTOR STORE -> stores.py  (numpy / faiss / chroma)
+Read the four sections below in order, then read chunkers.py and stores.py.
 """
 
 from __future__ import annotations
@@ -26,8 +28,9 @@ import os
 
 import numpy as np
 
-# Chunking strategies live in their own module now.
+# Chunking strategies and vector-store backends live in their own modules now.
 from chunkers import Chunk, Chunker, FixedTokenChunker
+from stores import VectorStore, NumpyStore
 
 # Load environment variables from a local .env file if python-dotenv is present.
 # This is what makes OPENAI_API_KEY available without exporting it by hand.
@@ -89,7 +92,7 @@ class Embedder:
 
     'all-MiniLM-L6-v2' is the standard starting point: small, fast, and good
     enough to learn with. We L2-normalise every vector so that cosine
-    similarity becomes a plain dot product (see VectorStore.search).
+    similarity becomes a plain dot product (see the vector stores in stores.py).
     """
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
@@ -113,36 +116,19 @@ def _normalize(vectors: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # SECTION 3 — The vector store + retrieval
 # ---------------------------------------------------------------------------
-# This is the "database" at the heart of RAG. It holds the chunk vectors in a
-# single numpy matrix. Searching is one matrix multiply: because every vector
-# is normalised, (matrix @ query) gives the cosine similarity of the query to
-# every chunk at once. We then take the highest scores.
+# This is the "database" at the heart of RAG: it holds one vector per chunk and,
+# given a query vector, returns the chunks whose vectors are closest. Like
+# chunking, it's now pluggable — the implementations live in stores.py behind a
+# single interface (.add and .search):
 #
-# A real system would use a vector database (Chroma, FAISS, Qdrant, ...) so it
-# scales to millions of vectors and persists to disk. For a few thousand
-# chunks, this 15-line version behaves identically.
-
-from dataclasses import dataclass, field
-
-
-@dataclass
-class VectorStore:
-    chunks: list[Chunk] = field(default_factory=list)
-    matrix: np.ndarray | None = None  # shape (n_chunks, embedding_dim)
-
-    def add(self, chunks: list[Chunk], vectors: np.ndarray) -> None:
-        self.chunks.extend(chunks)
-        self.matrix = vectors if self.matrix is None else np.vstack([self.matrix, vectors])
-
-    def search(self, query_vector: np.ndarray, k: int = 4) -> list[tuple[Chunk, float]]:
-        """Return the k chunks most similar to the query, with scores."""
-        if self.matrix is None:
-            return []
-        scores = self.matrix @ query_vector            # cosine similarity to every chunk
-        k = min(k, len(self.chunks))
-        top = np.argpartition(-scores, k - 1)[:k]      # k highest (unsorted)
-        top = top[np.argsort(-scores[top])]            # then sort those k
-        return [(self.chunks[i], float(scores[i])) for i in top]
+#   NumpyStore   one numpy matrix, exact brute-force search   (the baseline)
+#   FaissStore   Meta's FAISS library — a fast in-process index, not a server
+#   ChromaStore  an embedded vector database (SQLite-for-vectors)
+#
+# A real large-scale system reaches for a managed/dedicated vector database so
+# it persists to disk and scales to billions of vectors. For a few thousand
+# chunks all three backends here behave identically; switch with `--store` and
+# run the same question through each to feel the difference.
 
 
 # ---------------------------------------------------------------------------
@@ -206,18 +192,20 @@ def generate_answer(question: str, retrieved: list[tuple[Chunk, float]], model: 
 class RAG:
     """Ties the four sections into one object: build an index, then query it.
 
-    You can hand it any chunker from chunkers.py. You can also hand it an
-    already-constructed Embedder — useful because the SemanticChunker needs an
-    embedder too, and sharing one instance means the 80 MB model loads once.
+    You can hand it any chunker from chunkers.py and any store from stores.py.
+    You can also hand it an already-constructed Embedder — useful because the
+    SemanticChunker needs an embedder too, and sharing one instance means the
+    80 MB model loads once.
     """
 
     def __init__(self, corpus_dir: str, chunker: Chunker | None = None,
                  embedder: Embedder | None = None,
+                 store: VectorStore | None = None,
                  model_name: str = "all-MiniLM-L6-v2"):
         self.corpus_dir = corpus_dir
         self.embedder = embedder or Embedder(model_name)
         self.chunker = chunker or FixedTokenChunker()
-        self.store = VectorStore()
+        self.store = store or NumpyStore()
 
     def build_index(self) -> int:
         """Load, chunk, embed, and store everything. Returns the chunk count."""

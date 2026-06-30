@@ -6,13 +6,20 @@ Usage:
     python main.py "who created Rust?"      # one-shot: answer a single question
     python main.py --k 6 "..."              # retrieve more chunks per question
     python main.py --chunker recursive "..."   # pick a chunking strategy
-    python main.py --chunker semantic "..."
+    python main.py --store faiss "..."         # pick a vector-store backend
+    python main.py --chunker semantic --store chroma "..."
 
 Chunking strategies (see chunkers.py). All sizes are measured in TOKENS:
     fixed       fixed token windows + overlap         (the original baseline)
     recursive   respect paragraph/line/sentence boundaries, recursively
     sentence    whole sentences grouped to a token budget
     semantic    cut where the topic actually shifts (uses the embedding model)
+
+Vector-store backends (see stores.py). The retrieved passages should be nearly
+identical across all three on a small corpus — the difference is scale/speed:
+    numpy       one numpy matrix, exact brute-force search   (the baseline)
+    faiss       Meta's FAISS library: a fast in-process index (pip install faiss-cpu)
+    chroma      an embedded vector database, SQLite-style     (pip install chromadb)
 
 The first run downloads the embedding model (~80 MB) once, then caches it, and
 tiktoken downloads its vocab once. Answer generation needs OPENAI_API_KEY (put
@@ -24,6 +31,7 @@ import argparse
 from rag import RAG, Embedder
 from chunkers import (Tokenizer, FixedTokenChunker, RecursiveChunker,
                       SentenceChunker, SemanticChunker)
+from stores import NumpyStore, FaissStore, ChromaStore
 
 CORPUS_DIR = "corpus"
 
@@ -41,6 +49,18 @@ def build_chunker(name: str, embedder: Embedder, tokenizer: Tokenizer):
     if name == "semantic":
         return SemanticChunker(embedder, percentile=90, max_tokens=256, tokenizer=tokenizer)
     raise ValueError(f"unknown chunker: {name}")
+
+
+def build_store(name: str):
+    """Construct the requested vector-store backend. They share one interface
+    (.add / .search), so the rest of the pipeline doesn't care which you pick."""
+    if name == "numpy":
+        return NumpyStore()
+    if name == "faiss":
+        return FaissStore()              # exact IndexFlatIP; pass index_type="hnsw" for ANN
+    if name == "chroma":
+        return ChromaStore()             # in-memory; pass persist_dir=... to keep on disk
+    raise ValueError(f"unknown store: {name}")
 
 
 def print_result(result: dict) -> None:
@@ -67,15 +87,20 @@ def main() -> None:
     parser.add_argument("--chunker", default="recursive",
                         choices=["fixed", "recursive", "sentence", "semantic"],
                         help="Chunking strategy (default: recursive).")
+    parser.add_argument("--store", default="numpy",
+                        choices=["numpy", "faiss", "chroma"],
+                        help="Vector-store backend (default: numpy).")
     args = parser.parse_args()
 
     # Build the embedder and tokenizer once, then share them with everything.
     embedder = Embedder()
     tokenizer = Tokenizer()
     chunker = build_chunker(args.chunker, embedder, tokenizer)
+    store = build_store(args.store)
 
-    print(f"Building index from '{CORPUS_DIR}/' using '{args.chunker}' chunking ...")
-    rag = RAG(CORPUS_DIR, chunker=chunker, embedder=embedder)
+    print(f"Building index from '{CORPUS_DIR}/' using '{args.chunker}' chunking "
+          f"and the '{args.store}' store ...")
+    rag = RAG(CORPUS_DIR, chunker=chunker, embedder=embedder, store=store)
     n = rag.build_index()
     print(f"Indexed {n} chunks.\n")
 
