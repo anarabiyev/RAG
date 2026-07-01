@@ -7,7 +7,17 @@ Usage:
     python main.py --k 6 "..."              # retrieve more chunks per question
     python main.py --chunker recursive "..."   # pick a chunking strategy
     python main.py --store faiss "..."         # pick a vector-store backend
-    python main.py --chunker semantic --store chroma "..."
+    python main.py --retriever hybrid "..."    # BM25 + dense, fused with RRF
+    python main.py --retriever hybrid --rerank "..."   # + cross-encoder rerank
+    python main.py --retriever bm25 "..."      # keyword-only (no embeddings)
+
+Retrieval strategies (see retrievers.py):
+    dense       embeddings + vector store (meaning-based; the original path)
+    bm25        from-scratch keyword ranking (exact terms embeddings miss)
+    hybrid      run both, fuse rankings with Reciprocal Rank Fusion  (default)
+
+Reranking (see rerankers.py): pass --rerank to retrieve a wide ~30-chunk pool
+and re-score it with a local cross-encoder down to the --k best. Off by default.
 
 Chunking strategies (see chunkers.py). All sizes are measured in TOKENS:
     fixed       fixed token windows + overlap         (the original baseline)
@@ -34,6 +44,8 @@ from rag import RAG, Embedder
 from chunkers import (Tokenizer, FixedTokenChunker, RecursiveChunker,
                       SentenceChunker, SemanticChunker)
 from stores import NumpyStore, FaissStore, ChromaStore, PineconeStore
+from retrievers import DenseRetriever, BM25Retriever, HybridRetriever
+from rerankers import NoOpReranker, CrossEncoderReranker
 
 CORPUS_DIR = "corpus"
 
@@ -67,6 +79,24 @@ def build_store(name: str):
     raise ValueError(f"unknown store: {name}")
 
 
+def build_retriever(name: str, embedder: Embedder, store):
+    """Construct the requested retriever. Dense uses the embedder + the chosen
+    store; bm25 needs neither (pure keyword); hybrid fuses the two with RRF."""
+    dense = DenseRetriever(embedder, store)
+    if name == "dense":
+        return dense
+    if name == "bm25":
+        return BM25Retriever()           # from-scratch keyword ranking, no store
+    if name == "hybrid":
+        return HybridRetriever(dense, BM25Retriever())   # both, fused via RRF
+    raise ValueError(f"unknown retriever: {name}")
+
+
+def build_reranker(enabled: bool):
+    """A local cross-encoder when --rerank is set, otherwise a pass-through."""
+    return CrossEncoderReranker() if enabled else NoOpReranker()
+
+
 def print_result(result: dict) -> None:
     print()
     if result["answer"]:
@@ -93,7 +123,14 @@ def main() -> None:
                         help="Chunking strategy (default: recursive).")
     parser.add_argument("--store", default="numpy",
                         choices=["numpy", "faiss", "chroma", "pinecone"],
-                        help="Vector-store backend (default: numpy).")
+                        help="Vector-store backend for the dense half (default: numpy).")
+    parser.add_argument("--retriever", default="hybrid",
+                        choices=["dense", "bm25", "hybrid"],
+                        help="Retrieval strategy (default: hybrid).")
+    parser.add_argument("--rerank", action="store_true",
+                        help="Rerank a wide candidate pool with a local cross-encoder.")
+    parser.add_argument("--candidates", type=int, default=30,
+                        help="Pool size retrieved before reranking (default: 30).")
     args = parser.parse_args()
 
     # Build the embedder and tokenizer once, then share them with everything.
@@ -101,10 +138,15 @@ def main() -> None:
     tokenizer = Tokenizer()
     chunker = build_chunker(args.chunker, embedder, tokenizer)
     store = build_store(args.store)
+    retriever = build_retriever(args.retriever, embedder, store)
+    reranker = build_reranker(args.rerank)
 
-    print(f"Building index from '{CORPUS_DIR}/' using '{args.chunker}' chunking "
-          f"and the '{args.store}' store ...")
-    rag = RAG(CORPUS_DIR, chunker=chunker, embedder=embedder, store=store)
+    store_note = f" (dense store: {args.store})" if args.retriever != "bm25" else ""
+    rerank_note = " + cross-encoder rerank" if args.rerank else ""
+    print(f"Building index from '{CORPUS_DIR}/' using '{args.chunker}' chunking, "
+          f"'{args.retriever}' retrieval{store_note}{rerank_note} ...")
+    rag = RAG(CORPUS_DIR, chunker=chunker, embedder=embedder,
+              retriever=retriever, reranker=reranker, candidates=args.candidates)
     n = rag.build_index()
     print(f"Indexed {n} chunks.\n")
 

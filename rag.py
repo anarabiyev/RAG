@@ -6,7 +6,9 @@ top to bottom and understand every step:
 
     documents -> chunks -> embeddings -> vector store
                                               |
-                       question -> embedding -> similarity search -> top-k chunks
+   question -> [ BM25 keyword  +  dense embedding ] -> RRF fuse -> ~30 candidates
+                                              |
+                            cross-encoder rerank -> top-k chunks
                                               |
                           chunks + question -> LLM -> grounded answer
 
@@ -16,10 +18,12 @@ The only third-party pieces are:
   - openai (optional)     : writes the final answer (skip it to run retrieval-only)
   - python-dotenv         : loads your OPENAI_API_KEY from a local .env file
 
-Two pipeline steps now live in their own modules, each behind one interface:
-  - CHUNKING       -> chunkers.py  (fixed / recursive / sentence / semantic)
-  - the VECTOR STORE -> stores.py  (numpy / faiss / chroma)
-Read the four sections below in order, then read chunkers.py and stores.py.
+Each pipeline step now lives in its own module, behind one interface:
+  - CHUNKING       -> chunkers.py    (fixed / recursive / sentence / semantic)
+  - the VECTOR STORE -> stores.py    (numpy / faiss / chroma / pinecone)
+  - RETRIEVAL      -> retrievers.py  (dense / bm25 / hybrid via RRF)
+  - RERANKING      -> rerankers.py   (none / local cross-encoder)
+Read the four sections below in order, then read those modules.
 """
 
 from __future__ import annotations
@@ -28,9 +32,11 @@ import os
 
 import numpy as np
 
-# Chunking strategies and vector-store backends live in their own modules now.
+# Chunking, vector stores, retrieval, and reranking each live in their own module.
 from chunkers import Chunk, Chunker, FixedTokenChunker
 from stores import VectorStore, NumpyStore
+from retrievers import Retriever, DenseRetriever
+from rerankers import Reranker, NoOpReranker
 
 # Load environment variables from a local .env file if python-dotenv is present.
 # This is what makes OPENAI_API_KEY available without exporting it by hand.
@@ -114,21 +120,25 @@ def _normalize(vectors: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# SECTION 3 — The vector store + retrieval
+# SECTION 3 — Retrieval (vector store, keyword search, fusion, reranking)
 # ---------------------------------------------------------------------------
-# This is the "database" at the heart of RAG: it holds one vector per chunk and,
-# given a query vector, returns the chunks whose vectors are closest. Like
-# chunking, it's now pluggable — the implementations live in stores.py behind a
-# single interface (.add and .search):
+# Retrieval is now a small pipeline of its own, and each piece is pluggable:
 #
-#   NumpyStore   one numpy matrix, exact brute-force search   (the baseline)
-#   FaissStore   Meta's FAISS library — a fast in-process index, not a server
-#   ChromaStore  an embedded vector database (SQLite-for-vectors)
+#   the VECTOR STORE (stores.py)   holds the dense vectors and finds the nearest
+#       NumpyStore / FaissStore / ChromaStore / PineconeStore
 #
-# A real large-scale system reaches for a managed/dedicated vector database so
-# it persists to disk and scales to billions of vectors. For a few thousand
-# chunks all three backends here behave identically; switch with `--store` and
-# run the same question through each to feel the difference.
+#   the RETRIEVER (retrievers.py)  decides HOW candidates are found
+#       DenseRetriever   embeddings + a vector store         (meaning)
+#       BM25Retriever    from-scratch keyword ranking        (exact terms)
+#       HybridRetriever  fuse both with Reciprocal Rank Fusion
+#
+#   the RERANKER (rerankers.py)    re-scores the shortlist with a cross-encoder
+#       NoOpReranker / CrossEncoderReranker
+#
+# The flow when everything is on: retrieve a WIDE candidate pool (~30) with the
+# hybrid retriever, then let the cross-encoder rerank it down to the top-k the
+# LLM actually sees. Retrieval only has to get the right chunk *somewhere* in
+# the pool; the reranker floats it to the top. See RAG.retrieve below.
 
 
 # ---------------------------------------------------------------------------
@@ -190,33 +200,58 @@ def generate_answer(question: str, retrieved: list[tuple[Chunk, float]], model: 
 # ---------------------------------------------------------------------------
 
 class RAG:
-    """Ties the four sections into one object: build an index, then query it.
+    """Ties the pipeline into one object: build an index, then query it.
 
-    You can hand it any chunker from chunkers.py and any store from stores.py.
-    You can also hand it an already-constructed Embedder — useful because the
-    SemanticChunker needs an embedder too, and sharing one instance means the
-    80 MB model loads once.
+    You can hand it any chunker (chunkers.py), any retriever (retrievers.py),
+    and any reranker (rerankers.py). You can also hand it an already-constructed
+    Embedder — useful because the SemanticChunker and the DenseRetriever both
+    need one, and sharing a single instance means the 80 MB model loads once.
+
+    `candidates` is the width of the shortlist retrieval hands to the reranker
+    (the "retrieve ~30, rerank to k" pattern). With no reranker it's ignored and
+    retrieval returns k directly.
     """
 
     def __init__(self, corpus_dir: str, chunker: Chunker | None = None,
                  embedder: Embedder | None = None,
-                 store: VectorStore | None = None,
+                 retriever: Retriever | None = None,
+                 reranker: Reranker | None = None,
+                 candidates: int = 30,
                  model_name: str = "all-MiniLM-L6-v2"):
         self.corpus_dir = corpus_dir
-        self.embedder = embedder or Embedder(model_name)
         self.chunker = chunker or FixedTokenChunker()
-        self.store = store or NumpyStore()
+        # Embeddings now live in the retriever, so we only need an Embedder if
+        # we're actually building the default dense retriever below. BM25-only
+        # setups pay nothing — no model download, no 80 MB load.
+        if retriever is None:
+            embedder = embedder or Embedder(model_name)
+            retriever = DenseRetriever(embedder, NumpyStore())
+        self.embedder = embedder
+        self.retriever = retriever
+        self.reranker = reranker or NoOpReranker()
+        self.candidates = candidates
 
     def build_index(self) -> int:
-        """Load, chunk, embed, and store everything. Returns the chunk count."""
+        """Load, chunk, and index everything. Returns the chunk count.
+
+        Note the embedding step moved *into* the retriever: DenseRetriever (and
+        the dense half of HybridRetriever) embeds and fills its store here, while
+        BM25Retriever builds its keyword index. BM25-only needs no embeddings.
+        """
         chunks = build_chunks(self.corpus_dir, self.chunker)
-        vectors = self.embedder.encode([c.text for c in chunks])
-        self.store.add(chunks, vectors)
+        self.retriever.index(chunks)
         return len(chunks)
 
     def retrieve(self, question: str, k: int = 4) -> list[tuple[Chunk, float]]:
-        query_vector = self.embedder.encode([question])[0]
-        return self.store.search(query_vector, k)
+        """Retrieve a wide candidate pool, then rerank it down to k.
+
+        With a NoOpReranker this is just "retrieve k". With a real reranker we
+        pull `max(k, candidates)` candidates first so the cross-encoder has a
+        deep enough pool to rescue a good chunk that ranked, say, 18th.
+        """
+        pool = max(k, self.candidates) if not isinstance(self.reranker, NoOpReranker) else k
+        candidates = self.retriever.retrieve(question, pool)
+        return self.reranker.rerank(question, candidates, top_k=k)
 
     def query(self, question: str, k: int = 4) -> dict:
         """Full RAG: retrieve, then generate. Returns answer + the sources used."""

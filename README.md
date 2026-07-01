@@ -190,6 +190,53 @@ off your machine entirely, on its own servers, so they survive not just a
 restart but a move to a different computer — the price being a network hop and an
 API key on every call.
 
+## Hybrid search, reranking & evaluation
+
+Retrieval used to be one step — embed the question, ask the store for the
+nearest vectors. It's now a short pipeline, mirroring the diagram
+*Query → (BM25 + Dense) → RRF → cross-encoder → top-k*, with each stage
+pluggable like the chunkers and stores.
+
+**Retrieval** (`retrievers.py`, choose with `--retriever`):
+
+- **`dense`** — embeddings + a vector store. Great at *meaning* ("garbage
+  collector" ≈ "automatic memory management"), weak at exact tokens.
+- **`bm25`** — a from-scratch Okapi BM25 keyword ranker (the honest baseline,
+  like `NumpyStore` for stores — no dependencies; `pip install bm25s` is the
+  fast graduate option). Nails exact terms embeddings miss: `GIL`, `pgvector`,
+  `gofmt`, version numbers.
+- **`hybrid`** *(default)* — run both and fuse with **Reciprocal Rank Fusion**:
+  ignore the two incomparable score scales, combine by *rank* (`1/(60+rank)`).
+  High in either list helps; high in both wins.
+
+**Reranking** (`rerankers.py`, enable with `--rerank`): the "retrieve wide,
+rerank narrow" pattern. Retrieval pulls a wide pool (`--candidates`, default 30),
+then a local cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) reads each
+`(question, chunk)` pair *together* and rescores to the `--k` best. Retrieval
+only has to get the right chunk *somewhere* in the pool; the reranker floats it
+up. The diagram's hosted `rerank-*` box is the same idea over an API — there's a
+drop-in template at the bottom of `rerankers.py`.
+
+```bash
+python main.py --retriever hybrid "does Go have a garbage collector?"
+python main.py --retriever hybrid --rerank "what is pgvector?"
+python main.py --retriever bm25 "what enforces Go's formatting?"   # no embeddings
+```
+
+**Evaluation** (`evaluate.py`): stop judging by eye. A small labeled set of
+(question → which file answers it) pairs is scored on **Hit@k** (did a chunk
+from the right file land in the top k?) and **MRR** (how high?). Use it to
+compare chunkers/retrievers objectively:
+
+```bash
+python evaluate.py --retriever hybrid --rerank          # score one config
+python evaluate.py --compare-chunkers --retriever hybrid  # all 4 chunkers, one table
+```
+
+Labels are by *source file* (cheap to hand-write, stable across chunkers, no API
+key). `ragas` is the standard for grading generated answers; this is the
+from-scratch retrieval-only version.
+
 ## Inspecting the chunkers
 
 Two small helper scripts let you *see* how the strategies differ on a document,
@@ -239,24 +286,27 @@ articles, or papers in a field you care about.
   isolate query cost; turn on Chroma's `persist_dir` so its index survives
   between runs; or try other networked DBs (Qdrant, Weaviate, or `pgvector` on
   Postgres).
-- **Hybrid search** — combine the embedding similarity with keyword (BM25)
-  matching, which catches exact terms (names, error codes) that embeddings miss.
-- **Reranking** — retrieve the top ~30 chunks, then use a cross-encoder or a
-  rerank API to re-score them down to the best few.
-- **Evaluation** — add a small set of question/expected-answer pairs and measure
-  retrieval quality (did the right chunk appear in the top *k*?), then use it to
-  compare the chunkers objectively instead of by eye. The `ragas` library is the
-  standard tool for this.
+- **Hybrid search** — *done.* `retrievers.py` adds a from-scratch BM25 keyword
+  retriever and fuses it with dense embeddings via Reciprocal Rank Fusion
+  (`--retriever hybrid`). See "Hybrid search, reranking & evaluation" above.
+- **Reranking** — *done.* `rerankers.py` adds a local cross-encoder that
+  re-scores a wide candidate pool down to the best few (`--rerank`).
+- **Evaluation** — *done.* `evaluate.py` ships a labeled question set and scores
+  Hit@k and MRR, with `--compare-chunkers` to rank the strategies by number.
+  `ragas` remains the tool to reach for once you're grading *generated answers*.
 - **PDF ingestion** — parse PDFs into text so you can point it at real documents.
 
 ## Files
 
 ```
 rag-from-scratch/
-├── rag.py              # core pipeline: loading, embeddings, retrieval, generation
+├── rag.py              # core pipeline: loading, chunking, retrieval, generation
 ├── chunkers.py         # the four pluggable chunking strategies + the tokenizer
 ├── stores.py           # the four pluggable vector-store backends (numpy/faiss/chroma/pinecone)
-├── main.py             # command-line interface (--chunker, --store, --k)
+├── retrievers.py       # retrieval strategies: dense / bm25 / hybrid (RRF fusion)
+├── rerankers.py        # cross-encoder reranking (none / local cross-encoder)
+├── evaluate.py         # retrieval-quality harness: labeled Q&A, Hit@k + MRR
+├── main.py             # command-line interface (--chunker, --store, --retriever, --rerank, --k)
 ├── inspect_chunks.py   # helper: chunk counts + sizes per strategy (quick overview)
 ├── dump_chunks.py      # helper: every chunk printed in full per strategy
 ├── corpus/             # sample documents — replace with your own
